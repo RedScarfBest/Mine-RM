@@ -2,6 +2,7 @@
 
 #include <stdexcept>
 
+#include "dev_video_camera.hpp"
 #include "hikrobot/hikrobot.hpp"
 #include "tools/yaml.hpp"
 
@@ -25,6 +26,10 @@ Camera::Camera(const std::string & config_path)
     auto vid_pid = tools::read<std::string>(yaml, "vid_pid");
     auto serial_number = tools::read<std::string>(yaml, "serial_number");
     camera_ = std::make_unique<HikRobot>(exposure_ms, gain, vid_pid, serial_number, rotation_angle);
+  }
+
+  else if (camera_name == "video") {
+    camera_ = std::make_unique<DevVideoCamera>(config_path);
   }
 
   else {
