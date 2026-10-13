@@ -28,7 +28,7 @@ int main(int argc, char * argv[])
 
   // 初始化工具类
   tools::Exiter exiter;
-  tools::Plotter plotter;   // 注意plotter工具的使用
+  tools::Plotter plotter;  // 注意plotter工具的使用
 
   // 初始化io类
   io::Camera camera(config_path);
@@ -44,7 +44,29 @@ int main(int argc, char * argv[])
 
   while (!exiter.exit()) {
     // Your code start
+    static int frame_count = 0;
 
+    camera.read(img, t);
+
+    if (!img.empty()) {
+      auto armors = yolo.detect(img, frame_count);
+
+      if (frame_count % 30 == 0) {
+        tools::logger()->info("frame_count: {}, armors.size(): {}", frame_count, armors.size());
+
+        for (const auto & armor : armors) {
+          tools::logger()->info(
+            "{} {} {} conf: {:.3f} center: ({:.0f}, {:.0f}) ratio: {:.2f}",
+            auto_aim::COLORS[armor.color], auto_aim::ARMOR_TYPES[armor.type],
+            auto_aim::ARMOR_NAMES[armor.name], armor.confidence, armor.center.x, armor.center.y,
+            armor.ratio);
+        }
+      }
+    }
+
+    int key = cv::waitKey(1);
+    if (key == 27 || key == 'q') break;
+    frame_count++;
     // Your code end
   }
 
