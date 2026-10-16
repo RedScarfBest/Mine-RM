@@ -41,8 +41,8 @@ Target::Target(
   // h: dh2 for outpost / z2 - z1 for vehicles
   Eigen::VectorXd x0{{center_x, 0, center_y, 0, center_z, 0, ypr[0], 0, r, 0, 0}};  //初始化预测量
   Eigen::VectorXd P0_dig_car{
-    {1, 64, 1, 64, 1, 64, 0.4, 100, 0, 0,
-     0}};  // Task_2 TODO: 根据实际情况，调整“后三项”预测量协方差矩阵参数
+    {1, 64, 1, 64, 1, 64, 0.4, 100, 0.01, 0.01,
+     0.01}};  // Task_2: 四板几何参数初始方差
 
   // Task_3 TODO: 为前哨站建立专有的初始状预测量及其协方差矩阵参数（P0_dig_outpost）
 
@@ -55,7 +55,9 @@ Target::Target(
     return c;
   };
 
-  ekf_ = tools::ExtendedKalmanFilter(x0, P0, x_add);  //初始化滤波器（预测量、预测量协方差）
+  tools::ExtendedKalmanFilter initial_filter(x0, P0, x_add);
+  initial_filter.last_nis = 0.0;
+  ekf_ = initial_filter;  //初始化滤波器（预测量、预测量协方差）
 }
 
 void Target::predict(std::chrono::steady_clock::time_point t)
@@ -88,9 +90,9 @@ void Target::predict(double dt)
   // https://github.com/rlabbe/Kalman-and-Bayesian-Filters-in-Python/blob/master/07-Kalman-Filter-Math.ipynb
   double v1, v2;
 
-  // Task_2 TODO: 根据实际情况，调整v1与v2
+  // Task_2: 固定种子旋转真值测试确定参数
   v1 = 1;           // 加速度方差
-  v2 = 1;           // 角加速度方差
+  v2 = 16;           // 角加速度方差
   double v1_z = 1;  // z轴加速度方差
 
   auto a = dt * dt * dt * dt / 4;
@@ -275,7 +277,7 @@ Eigen::Vector3d Target::h_armor_xyz(const Eigen::VectorXd & x, int id) const
   auto armor_x = x[0] - r * std::cos(angle);
   auto armor_y = x[2] - r * std::sin(angle);
 
-  double dh = 0.0;  // 高度差
+  double dh = use_l_h ? x[10] : 0.0;  // 高度差
   // Task_3 TODO: 为前哨站建立专有的高度差计算方法
 
   auto armor_z = x[4] + dh;  //task_3 tips
