@@ -49,38 +49,42 @@ int main(int argc, char * argv[])
 
   while (!exiter.exit()) {
     // Your code start
+    // Module 1: Persistent tracking state and per-frame candidate data.
+    // Static state survives loop iterations; angles use radians and positions use meters.
     struct Task1State {
       int frame = 0;
-      bool locked = false;
-      bool commanding = false;
+      bool locked = false;      // Keep the selected armor identity until release or timeout.
+      bool commanding = false;  // True after a valid control command has been generated.
       auto_aim::ArmorName name = auto_aim::not_armor;
-      cv::Point2f center{};
-      double aim_yaw = 0;
-      double aim_pitch = 0;
-      float command_yaw = 0;
-      float command_pitch = 0;
+      cv::Point2f center{};     // Last selected image center, used only for target association.
+      double aim_yaw = 0;       // Target direction in world coordinates, before angular offsets.
+      double aim_pitch = 0;     // Target elevation in world coordinates, before angular offsets.
+      float command_yaw = 0;    // Last yaw command after offset and slew limiting (rad).
+      float command_pitch = 0;  // Last pitch command after offset and limits (rad).
       std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
-      std::chrono::steady_clock::time_point seen{};
-      std::chrono::steady_clock::time_point last_frame{};
-      std::chrono::steady_clock::time_point output = started;
+      std::chrono::steady_clock::time_point seen{};  // Timestamp of the last valid target image.
+      std::chrono::steady_clock::time_point last_frame{};  // Reject repeated or reversed timestamps.
+      std::chrono::steady_clock::time_point output = started;  // Previous command-generation time.
     };
     struct Task1Config {
       auto_aim::Color enemy;
-      double yaw_offset;
-      double pitch_offset;
-      cv::Mat camera_matrix;
-      cv::Mat distortion;
-      Eigen::Matrix3d camera_to_gimbal;
-      Eigen::Vector3d camera_translation;
-      Eigen::Vector3d yaw_to_pitch;
+      double yaw_offset;                 // YAML yaw correction, converted from degrees to radians.
+      double pitch_offset;               // YAML pitch correction, converted from degrees to radians.
+      cv::Mat camera_matrix;             // Camera intrinsics for the actual image resolution.
+      cv::Mat distortion;                // Five camera distortion coefficients.
+      Eigen::Matrix3d camera_to_gimbal;  // Camera-to-gimbal rotation from calibration.
+      Eigen::Vector3d camera_translation;  // Camera origin in the gimbal frame (m).
+      Eigen::Vector3d yaw_to_pitch;        // Optional yaw-axis-to-pitch-axis offset (m).
     };
     struct Candidate {
       auto_aim::ArmorName name;
       cv::Point2f center;
       double confidence;
-      Eigen::Vector3d ypd;
+      Eigen::Vector3d ypd;  // Target yaw (rad), pitch (rad), and distance (m).
     };
     static Task1State state;
+    // Module 2: Load configuration once and validate the local PnP inputs.
+    // Use calibration for this robot; changing YAML requires restarting the program.
     static const Task1Config config = [&] {
       const auto yaml = tools::load(config_path);
       const auto enemy = tools::read<std::string>(yaml, "enemy_color");
@@ -91,6 +95,7 @@ int main(int argc, char * argv[])
           std::abs(pitch_offset) > CV_PI) {
         throw std::runtime_error("Invalid Task 1 color or angular offsets");
       }
+      // Check vector sizes before constructing matrices from their data pointers.
       auto read_vector = [&](const char* key, std::size_t size) {
         auto values = tools::read<std::vector<double>>(yaml, key);
         if (values.size() != size ||
@@ -99,8 +104,8 @@ int main(int argc, char * argv[])
         }
         return values;
       };
-      const auto k = read_vector("camera_matrix", 9);
-      const auto d = read_vector("distort_coeffs", 5);
+      const auto k = read_vector("camera_matrix", 9);   // Row-major 3x3 intrinsic matrix.
+      const auto d = read_vector("distort_coeffs", 5);  // k1, k2, p1, p2, k3.
       const auto r = read_vector("R_camera2gimbal", 9);
       const auto translation = read_vector("t_camera2gimbal", 3);
       Eigen::Vector3d yaw_to_pitch = Eigen::Vector3d::Zero();
@@ -121,11 +126,22 @@ int main(int argc, char * argv[])
                          Eigen::Vector3d(translation.data()),
                          yaw_to_pitch};
     }();
-    constexpr double hold_seconds = 0.150;
-    constexpr double frame_valid_seconds = 0.150;
-    constexpr auto camera_timeout = std::chrono::milliseconds(50);
-    constexpr double pitch_limit = static_cast<float>(20.0 * CV_PI / 180.0);
-    const bool print_log = state.frame % 30 == 0;
+    // Module 3: Timing, motion limits, and validation helpers.
+    static const double hold_seconds = [&] {
+      const auto yaml = tools::load(config_path);
+      const double seconds = tools::read_or<double>(yaml, "task1_hold_seconds", 0.300);
+
+      if (!std::isfinite(seconds) || seconds < 0.0 || seconds > 0.5) {
+        throw std::runtime_error("task1_hold_seconds must be within [0, 0.5] seconds");
+      }
+
+      return seconds;
+    }();  // Keep the last command for ordinary detection misses (s).
+    constexpr double frame_valid_seconds = 0.150;  // Maximum software image age at decision time (s).
+    constexpr auto camera_timeout = std::chrono::milliseconds(50);  // Camera queue wait budget (ms).
+    constexpr double pitch_limit =
+        static_cast<float>(20.0 * CV_PI / 180.0);  // +/-20 deg, matching float feedback precision.
+    const bool print_log = state.frame % 30 == 0;  // Print detailed diagnostics every 30 iterations.
     auto clear_target = [&] {
       state.locked = false;
       state.commanding = false;
@@ -136,6 +152,8 @@ int main(int argc, char * argv[])
       });
     };
 
+    // Module 4: Read a frame, release stale input, and check the operating mode.
+    // Camera gaps pause commands; target identity expires by its observation age.
     const auto cycle_started = std::chrono::steady_clock::now();
     const bool camera_ok = camera.try_read_for(img, t, camera_timeout);
     if (!camera_ok) img.release();
@@ -143,7 +161,6 @@ int main(int argc, char * argv[])
     double detect_seconds = 0;
     double solve_seconds = 0;
     int rejected_candidates = 0;
-    bool invalid_candidate = false;
     auto mode = gimbal.mode();
     const auto before_detection = std::chrono::steady_clock::now();
     if (mode != io::GimbalMode::AUTO_AIM ||
@@ -154,21 +171,27 @@ int main(int argc, char * argv[])
     bool fresh_target = false;
     std::optional<Candidate> selected;
     double best_score = 0;
+    // Module 5: Validate image time and obtain the corresponding gimbal orientation.
+    // Detection and image display run only in AUTO_AIM; there is no observation-only mode.
     if (!invalid_frame && mode == io::GimbalMode::AUTO_AIM) {
       const double age = tools::delta_time(before_detection, t);
       if (age < 0 || age > frame_valid_seconds || t <= state.last_frame) {
         invalid_frame = true;
       } else {
         state.last_frame = t;
+        // This framework call can block; camera_timeout does not limit its wait.
         q = gimbal.q(t);
       }
       const double norm = invalid_frame ? 0.0 : q.norm();
+      // Reject nonfinite or near-zero quaternions before normalization (norm threshold: 1e-6).
       if (invalid_frame || !q.coeffs().allFinite() || !std::isfinite(norm) || norm <= 1e-6) {
         invalid_frame = true;
         if (print_log) tools::logger()->warn("invalid_quaternion_or_frame_time");
       } else {
         q.normalize();
         solver.set_R_gimbal2world(q);
+        // Module 6: Detect armor and solve each relevant candidate independently.
+        // One bad candidate must not discard another valid target in the same image.
         const auto detection_started = std::chrono::steady_clock::now();
         auto armors = yolo.detect(img, state.frame);
         detect_seconds = tools::delta_time(std::chrono::steady_clock::now(), detection_started);
@@ -178,33 +201,37 @@ int main(int argc, char * argv[])
           tools::logger()->info("frame_count: {}, armors.size(): {}", state.frame, armors.size());
         }
         for (auto& armor : armors) {
-          if (armor.color != config.enemy || (state.locked && armor.name != state.name)) continue;
+          // Filter color before PnP; associate valid candidates by world direction.
+          if (armor.color != config.enemy) continue;
           if (armor.points.size() != 4 || !points_finite(armor.points) ||
               !std::isfinite(armor.center.x) || !std::isfinite(armor.center.y) ||
-              !std::isfinite(armor.confidence) || !std::isfinite(armor.ratio) ||
-              std::abs(cv::contourArea(armor.points)) <= 1.0) {
-            invalid_candidate = true;
+              !std::isfinite(armor.confidence) ||
+              std::abs(cv::contourArea(armor.points)) <= 1.0) {  // Reject area <= 1 square pixel.
             ++rejected_candidates;
             if (print_log) tools::logger()->warn("invalid_points");
             continue;
           }
           std::vector<cv::Point2f> projected;
           try {
+            // Physical plate widths: big 0.230 m, special 0.129 m, small 0.135 m.
             const float width = armor.type == auto_aim::big       ? 0.230f
                                 : armor.type == auto_aim::special ? 0.129f
                                                                   : 0.135f;
+            // Plate corners follow detector order; 0.028 m is half the 0.056 m height.
             const std::vector<cv::Point3f> object_points{{0, width / 2, 0.028f},
                                                          {0, -width / 2, 0.028f},
                                                          {0, -width / 2, -0.028f},
                                                          {0, width / 2, -0.028f}};
             cv::Vec3d rvec(0, 0, 0), tvec(0, 0, 0);
-            const bool solved = cv::solvePnP(object_points, armor.points, config.camera_matrix,
-                                             config.distortion, rvec, tvec, false, cv::SOLVEPNP_IPPE);
+            const bool solved = cv::solvePnP(
+                object_points, armor.points, config.camera_matrix, config.distortion, rvec, tvec,
+                false, cv::SOLVEPNP_IPPE);  // Planar PnP, without an initial guess.
+            // Accept only a successful finite solution in front of the camera (positive Z).
             if (!solved || !cv::checkRange(rvec) || !cv::checkRange(tvec) || tvec[2] <= 0) {
-              invalid_candidate = true;
               ++rejected_candidates;
               continue;
             }
+            // Transform the solved center: camera -> gimbal -> world, including axis offset.
             const Eigen::Vector3d camera_position(tvec[0], tvec[1], tvec[2]);
             armor.xyz_in_gimbal =
                 config.camera_to_gimbal * camera_position + config.camera_translation;
@@ -214,6 +241,7 @@ int main(int argc, char * argv[])
                 Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix();
             armor.xyz_in_world = rotation * armor.xyz_in_gimbal + yaw_rotation * config.yaw_to_pitch;
             armor.ypd_in_world = tools::xyz2ypd(armor.xyz_in_world);
+            // Raw-pose reprojection is diagnostic; projection failure does not veto position.
             try {
               cv::projectPoints(object_points, rvec, tvec, config.camera_matrix, config.distortion,
                                 projected);
@@ -221,21 +249,20 @@ int main(int argc, char * argv[])
               if (print_log) tools::logger()->warn("projection_unavailable: {}", error.what());
             }
           } catch (const cv::Exception& error) {
-            invalid_candidate = true;
             ++rejected_candidates;
             if (print_log) tools::logger()->warn("solve_failed: {}", error.what());
             continue;
           }
           if (!armor.xyz_in_gimbal.allFinite() || !armor.xyz_in_world.allFinite() ||
               !armor.ypd_in_world.allFinite() || armor.ypd_in_world[2] <= 0) {
-            invalid_candidate = true;
             ++rejected_candidates;
             if (print_log) tools::logger()->warn("invalid_pose");
             continue;
           }
           bool reprojection_valid = false;
           double reprojection_error = 0;
-          tools::draw_points(img_show, armor.points, cv::Scalar(0, 255, 0), 3);
+          tools::draw_points(img_show, armor.points, cv::Scalar(0, 255, 0),
+                             3);  // Green: detected corners.
           try {
             if (projected.size() == 4 && points_finite(projected)) {
               double sum = 0;
@@ -243,7 +270,8 @@ int main(int argc, char * argv[])
               if (std::isfinite(sum)) {
                 reprojection_error = sum / 4.0;
                 reprojection_valid = true;
-                tools::draw_points(img_show, projected, cv::Scalar(0, 0, 255), 3);
+                tools::draw_points(img_show, projected, cv::Scalar(0, 0, 255),
+                                   3);  // Red: raw PnP projection.
               }
             }
           } catch (const cv::Exception& error) {
@@ -259,36 +287,59 @@ int main(int argc, char * argv[])
                 armor.ypd_in_world[2], armor.ypd_in_world[0], armor.ypd_in_world[1],
                 static_cast<int>(reprojection_valid), reprojection_error);
           }
+          // Prefer the image center on acquisition, or the previous target center while locked.
+          // Confidence breaks equal-distance ties; the image center is not the 3D aim point.
           const cv::Point2f reference =
               state.locked ? state.center : cv::Point2f(img.cols * 0.5f, img.rows * 0.5f);
-          const double score = cv::norm(armor.center - reference);
+          double score = cv::norm(armor.center - reference);
+          if (state.locked) {
+            const double yaw_delta = std::remainder(armor.ypd_in_world[0] - state.aim_yaw, 2 * CV_PI);
+            const double pitch_delta = armor.ypd_in_world[1] - state.aim_pitch;
+            const double separation = std::hypot(yaw_delta, pitch_delta);
+            if (separation > 15.0 * CV_PI / 180.0) continue;
+            score = separation + (armor.name == state.name ? 0.0 : 0.02);
+          }
           if (!selected || score < best_score ||
               (score == best_score && armor.confidence > selected->confidence)) {
             selected = Candidate{armor.name, armor.center, armor.confidence, armor.ypd_in_world};
             best_score = score;
           }
         }
-        solve_seconds = tools::delta_time(std::chrono::steady_clock::now(), solve_started);
-        cv::resize(img_show, img_show, cv::Size(), 0.5, 0.5);
+        solve_seconds = tools::delta_time(std::chrono::steady_clock::now(),
+                                          solve_started);  // Includes candidate drawing.
+        cv::resize(img_show, img_show, cv::Size(), 0.5,
+                   0.5);  // Display at half size; PnP uses original pixels.
         cv::imshow("reprojected_points (raw PnP)", img_show);
       }
     }
 
-    if (invalid_candidate && !selected) invalid_frame = true;
+    // Module 7: Apply feedback, exit, and end-of-processing freshness checks.
     const auto measured = gimbal.state();
     const bool feedback_valid = std::isfinite(measured.yaw) && std::isfinite(measured.pitch) &&
-                                std::abs(measured.yaw) <= 1000.0;
+                                std::abs(measured.pitch) <= CV_PI / 2;
+    const double feedback_yaw =
+        feedback_valid ? std::remainder(double(measured.yaw), 2 * CV_PI) : 0.0;
+    // Numeric validity does not prove serial feedback freshness; the framework exposes no age.
     const bool pitch_in_range = feedback_valid && std::abs(measured.pitch) <= pitch_limit;
-    const int key = cv::waitKey(1);
+    const int key = cv::waitKey(1);  // Pump GUI events; q/Esc works only when this point is reached.
     const bool quitting = key == 27 || key == 'q' || exiter.exit();
     const auto now = std::chrono::steady_clock::now();
     mode = gimbal.mode();
     const double frame_age = tools::delta_time(now, t);
     if (!img.empty() && (frame_age < 0 || frame_age > frame_valid_seconds)) invalid_frame = true;
-    const bool permitted = mode == io::GimbalMode::AUTO_AIM && feedback_valid && pitch_in_range &&
-                           !invalid_frame && !quitting;
+    // AUTO_AIM, credible feedback, fresh input, and no exit request are required.
+    const bool permitted =
+        mode == io::GimbalMode::AUTO_AIM && feedback_valid && !invalid_frame && !quitting;
+    // Module 8: Update tracking and generate offset-corrected, limited angle commands.
+    // On takeover start from feedback; subsequent commands advance from the previous command.
     if (!permitted) {
-      clear_target();
+      const bool short_camera_gap = (!camera_ok || img.empty()) && mode == io::GimbalMode::AUTO_AIM &&
+                                    feedback_valid && !quitting && state.locked &&
+                                    tools::delta_time(now, state.seen) <= hold_seconds;
+      if (short_camera_gap)
+        state.commanding = false;
+      else
+        clear_target();
     } else if (selected) {
       state.locked = true;
       state.name = selected->name;
@@ -296,32 +347,44 @@ int main(int argc, char * argv[])
       state.seen = t;
       state.aim_yaw = selected->ypd[0];
       state.aim_pitch = selected->ypd[1];
-      const double desired_yaw =
-          measured.yaw +
-          std::remainder(state.aim_yaw + config.yaw_offset - measured.yaw, 2.0 * CV_PI);
-      const double desired_pitch =
-          tools::limit_min_max(state.aim_pitch + config.pitch_offset, -pitch_limit, pitch_limit);
-      const double dt = tools::limit_min_max(tools::delta_time(now, state.output), 0.0, 0.1);
-      const double base_yaw = state.commanding ? state.command_yaw : measured.yaw;
+      // Use circular yaw differences and keep pitch output within its soft range.
+      const double desired_yaw = std::remainder(state.aim_yaw + config.yaw_offset, 2.0 * CV_PI);
+      const double desired_pitch = tools::limit_min_max(-state.aim_pitch + config.pitch_offset,
+                                                        -pitch_limit, pitch_limit);  // edit
+      const double dt = tools::limit_min_max(tools::delta_time(now, state.output), 0.0,
+                                             0.1);  // Cap slew time at 100 ms after delays.
+      const double base_yaw = state.commanding ? state.command_yaw : feedback_yaw;
       const double base_pitch = state.commanding ? state.command_pitch : measured.pitch;
-      state.command_yaw = static_cast<float>(
+      state.command_yaw = static_cast<float>(std::remainder(
           base_yaw + tools::limit_min_max(std::remainder(desired_yaw - base_yaw, 2.0 * CV_PI),
-                                          -3.0 * dt, 3.0 * dt));
-      state.command_pitch = static_cast<float>(
-          tools::limit_min_max(base_pitch + tools::limit_min_max(desired_pitch - base_pitch, -dt, dt),
-                               -pitch_limit, pitch_limit));
-      state.commanding = true;
+                                          -3.0 * dt, 3.0 * dt),
+          2.0 * CV_PI));  // Maximum yaw command slew: 3 rad/s.
+      state.command_pitch = static_cast<float>(tools::limit_min_max(
+          base_pitch + tools::limit_min_max(desired_pitch - base_pitch, -dt, dt), -pitch_limit,
+          pitch_limit));  // +/-dt gives a 1 rad/s pitch slew limit.
+      state.commanding = std::abs(state.command_pitch - base_pitch) <= dt + 1e-6;
       fresh_target = true;
-    } else if (!state.locked || tools::delta_time(now, state.seen) > hold_seconds) {
+    } else if (!state.locked || tools::delta_time(now, state.seen) >
+                                    hold_seconds) {  // Release expired ordinary-miss holds.
       clear_target();
     }
     const bool control = permitted && state.locked && state.commanding;
-    const float command_yaw = control ? state.command_yaw : (feedback_valid ? measured.yaw : 0.0f);
+    const float command_yaw =
+        control ? static_cast<float>(std::remainder(double(state.command_yaw), 2.0 * CV_PI))
+                : static_cast<float>(feedback_yaw);  // edit
     const float command_pitch =
         control ? state.command_pitch : (feedback_valid ? measured.pitch : 0.0f);
     const double observation_age = state.locked ? tools::delta_time(now, state.seen) : 0.0;
-    const int tracking_state = !control ? 0 : (fresh_target ? 1 : 2);
-    gimbal.send(control, false, command_yaw, command_pitch);
+    const int tracking_state =
+        !control ? 0 : (fresh_target ? 1 : 2);  // 0: off, 1: tracking, 2: holding.
+    // Module 9: Send gimbal angles and publish matching diagnostic data.
+    // Plotter sends UDP JSON; open PlotJuggler separately on 127.0.0.1:9870.
+    gimbal.send(control, false, command_yaw,
+                command_pitch);  // fire=false; no chassis movement command.
+    // All *_rad fields use radians. aim_* is before offsets; command_* is the final command.
+    // When aim_valid=false, the zero aim values are placeholders, not a valid target direction.
+    // Software image age is not full exposure-to-actuation latency.
+    // cycle_s ends before serial/UDP sending; solve_s includes candidate processing and drawing.
     plotter.plot({{"frame", state.frame},
                   {"time_s", tools::delta_time(now, state.started)},
                   {"mode", static_cast<int>(mode)},
@@ -337,6 +400,11 @@ int main(int argc, char * argv[])
                   {"feedback_valid", feedback_valid},
                   {"feedback_yaw_rad", feedback_valid ? measured.yaw : 0.0f},
                   {"feedback_pitch_rad", feedback_valid ? measured.pitch : 0.0f},
+                  {"internal_command_yaw_rad", state.command_yaw},
+                  {"feedback_yaw_raw_rad", std::isfinite(measured.yaw) ? measured.yaw : 0.0f},
+                  {"feedback_pitch_raw_rad", std::isfinite(measured.pitch) ? measured.pitch : 0.0f},
+                  {"control_permitted", permitted},
+                  {"command_ready", state.commanding},
                   {"control", control},
                   {"fire", false},
                   {"invalid_frame", invalid_frame},
@@ -353,7 +421,8 @@ int main(int argc, char * argv[])
                   {"quitting", quitting}});
     state.output = now;
     ++state.frame;
-    if (quitting) break;
+    if (quitting)
+      break;  // Reached q/Esc exits after send; blocked I/O or Ctrl+C may bypass final stop.
 
     // Your code end
   }
