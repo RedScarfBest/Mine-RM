@@ -298,31 +298,47 @@ int main(int argc, char * argv[])
     int board_id = -1;
     const bool speed_valid = std::isfinite(feedback.bullet_speed) && feedback.bullet_speed >= 5 &&
                              feedback.bullet_speed <= 40;
-    if (state.target && permitted && speed_valid) {
+    if (state.target && permitted) {
       double best = std::numeric_limits<double>::infinity();
       for (int id = 0; id < 4; ++id) {
-        double fly = state.target->armor_xyza_list()[id].head<3>().norm() / feedback.bullet_speed;
+        double fly = 0;
         double pitch = 0;
         Eigen::Vector4d board = Eigen::Vector4d::Zero();
         bool solved = false;
         double prediction_time = 0;
-        for (int iteration = 0; iteration < 8; ++iteration) {
-          prediction_time = tools::delta_time(now, state.model_time) + config.execution_delay + fly;
-          if (prediction_time < 0 || prediction_time > 1.0) break;
-          auto future = *state.target;
-          future.predict(prediction_time);
-          board = future.armor_xyza_list()[id];
+        if (speed_valid) {
+          fly = state.target->armor_xyza_list()[id].head<3>().norm() / feedback.bullet_speed;
+          for (int iteration = 0; iteration < 8; ++iteration) {
+            prediction_time = tools::delta_time(now, state.model_time) + config.execution_delay + fly;
+            if (prediction_time < 0 || prediction_time > 1.0) break;
+            auto future = *state.target;
+            future.predict(prediction_time);
+            board = future.armor_xyza_list()[id];
+            const double distance = board.head<2>().norm();
+            if (!board.allFinite() || distance < 0.1) break;
+            tools::Trajectory trajectory(feedback.bullet_speed, distance, board[2], 1);
+            if (
+              trajectory.unsolvable || !std::isfinite(trajectory.pitch) ||
+              !std::isfinite(trajectory.fly_time) || trajectory.fly_time <= 0)
+              break;
+            pitch = trajectory.pitch;
+            solved = std::abs(trajectory.fly_time - fly) < 1e-4;
+            fly = trajectory.fly_time;
+            if (solved) break;
+          }
+        } else {
+          // Without measured bullet speed, follow the current line of sight only.
+          // Advance a copy to now; no guessed flight time or ballistic compensation.
+          prediction_time = tools::delta_time(now, state.model_time);
+          if (!std::isfinite(prediction_time) || prediction_time < 0 || prediction_time > 1.0)
+            continue;
+          auto current = *state.target;
+          current.predict(prediction_time);
+          board = current.armor_xyza_list()[id];
           const double distance = board.head<2>().norm();
-          if (!board.allFinite() || distance < 0.1) break;
-          tools::Trajectory trajectory(feedback.bullet_speed, distance, board[2], 1);
-          if (
-            trajectory.unsolvable || !std::isfinite(trajectory.pitch) ||
-            !std::isfinite(trajectory.fly_time) || trajectory.fly_time <= 0)
-            break;
-          pitch = trajectory.pitch;
-          solved = std::abs(trajectory.fly_time - fly) < 1e-4;
-          fly = trajectory.fly_time;
-          if (solved) break;
+          if (!board.allFinite() || distance < 0.1) continue;
+          pitch = std::atan2(board[2], distance);
+          solved = true;
         }
         if (!solved) continue;
         const double yaw = std::atan2(board[1], board[0]);
@@ -358,7 +374,9 @@ int main(int argc, char * argv[])
       stable = false;
       aim_valid = false;
     }
+    const bool ballistic_aim_valid = aim_valid && speed_valid;
     const bool control = permitted && state.target && aim_valid;
+    const bool geometric_tracking = control && !speed_valid;
     if (control) {
       const double dt =
         tools::limit_min_max(tools::delta_time(command_time, state.output), 0.0, 0.1);
@@ -388,7 +406,8 @@ int main(int argc, char * argv[])
       !state.previous_fire && (state.last_fire.time_since_epoch().count() == 0 ||
                                tools::delta_time(command_time, state.last_fire) >= 0.2);
     const bool fire =
-      config.fire_enabled && control && fresh_target && stable && facing && aligned && cooldown;
+      config.fire_enabled && control && ballistic_aim_valid && fresh_target && stable && facing &&
+      aligned && cooldown;
     if (quitting)
       reason = "quitting";
     else if (mode != io::GimbalMode::AUTO_AIM)
@@ -485,6 +504,8 @@ int main(int argc, char * argv[])
        {"observation_age_s", state.target ? tools::delta_time(sent_time, state.seen) : 0.0},
        {"frame_age_s", tools::delta_time(sent_time, t)},
        {"aim_valid", aim_valid},
+       {"ballistic_aim_valid", ballistic_aim_valid},
+       {"geometric_tracking", geometric_tracking},
        {"aim_yaw_rad", aim_yaw},
        {"aim_pitch_rad", aim_pitch},
        {"prediction_time_s", horizon},
@@ -507,8 +528,10 @@ int main(int argc, char * argv[])
        {"quitting", quitting}});
     if (state.frame % 30 == 0) {
       tools::logger()->info(
-        "task2 frame={} state={} omega_rad_s={:.3f} stable={} control={} fire={} reason={}",
-        state.frame, tracking_state, omega, stable, control, fire, reason);
+        "task2 frame={} state={} omega_rad_s={:.3f} stable={} control={} fire={} reason={} "
+        "bullet_speed_m_s={:.3f} ballistic_aim_valid={}",
+        state.frame, tracking_state, omega, stable, control, fire, reason,
+        std::isfinite(feedback.bullet_speed) ? feedback.bullet_speed : 0.0f, ballistic_aim_valid);
     }
     state.previous_fire = fire;
     state.output = send_finished;
