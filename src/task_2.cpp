@@ -80,7 +80,7 @@ int main(int argc, char * argv[])
       double execution_delay;
       double hold_seconds;
       double target_radius;
-      double default_bullet_speed;  // used until the referee reports a measured speed //edit
+      double default_bullet_speed;  // used until the referee reports a measured speed  
     };
     static Task2State state;
     static const Task2Config config = [&] {
@@ -88,16 +88,15 @@ int main(int argc, char * argv[])
       const auto enemy = tools::read<std::string>(yaml, "enemy_color");
       const double yaw = tools::read<double>(yaml, "yaw_offset") * CV_PI / 180.0;
       const double pitch = tools::read<double>(yaml, "pitch_offset") * CV_PI / 180.0;
-      const double delay = tools::read_or<double>(yaml, "task2_execution_delay_s", 0.045);//hhh
+      const double delay = tools::read_or<double>(yaml, "task2_execution_delay_s", 0.0);//hhh
       const double hold = tools::read_or<double>(yaml, "task2_hold_seconds", 0.300);
       const double radius = tools::read_or<double>(yaml, "task2_target_radius_m", 0.2);
-      // A measured speed only exists after the first shot (referee 0x020C shoot_data), so a
-      // configured fallback is required or the first round can never leave the barrel. //edit
-      const double default_v0 =  //edit
-        tools::read_or<double>(yaml, "task2_default_bullet_speed_m_s", 22.0);  //edit
-      if (!std::isfinite(default_v0) || default_v0 <= 0 || default_v0 > 100) {  //edit
-        throw std::runtime_error("task2_default_bullet_speed_m_s must be within (0, 100]");  //edit
-      }  //edit
+      
+      const double default_v0 =   
+        tools::read_or<double>(yaml, "task2_default_bullet_speed_m_s", 22.0);   
+      if (!std::isfinite(default_v0) || default_v0 <= 0 || default_v0 > 100) {   
+        throw std::runtime_error("task2_default_bullet_speed_m_s must be within (0, 100]");   
+      }   
       if (!std::isfinite(radius) || radius <= 0.05 || radius >= 0.5) {
         throw std::runtime_error("task2_target_radius_m must be within (0.05, 0.5) metres");
       }
@@ -112,24 +111,26 @@ int main(int argc, char * argv[])
       }
       return Task2Config{
         enemy == "red" ? auto_aim::red : auto_aim::blue, yaw, pitch, delay, hold, radius,
-        default_v0};  //edit
+        default_v0};   
     }();
     const double hold_seconds = config.hold_seconds;  // Ordinary misses; zero disables coasting.
     constexpr auto camera_timeout = std::chrono::milliseconds(50);
     constexpr double frame_valid_seconds = 0.150;
     constexpr double pitch_limit = static_cast<float>(20.0 * CV_PI / 180.0);
 
-    // Print the calibration once. These are per-robot values, and they are easy to run with the
-    // wrong yaml or the wrong unit, so show both rad and deg, and the fallback bullet speed. //edit
-    static bool calibration_logged = false;  //edit
-    if (!calibration_logged) {  //edit
-      tools::logger()->info(  //edit
-        "[task2] yaw_offset={:.3f} rad ({:+.3f} deg)  pitch_offset={:.3f} rad ({:+.3f} deg)  "  //edit
-        "default_v0={:.2f} m/s  hold={:.2f} s",  //edit
-        config.yaw_offset, config.yaw_offset * 180.0 / CV_PI, config.pitch_offset,  //edit
-        config.pitch_offset * 180.0 / CV_PI, config.default_bullet_speed, hold_seconds);  //edit
-      calibration_logged = true;  //edit
-    }  //edit
+    constexpr double task2_board_hysteresis = 0.1;  // rad, 0.0 = no stickiness  
+      
+    constexpr double task2_fire_face_limit = 0.26;  // rad, ~15 deg; 0.0 = disabled  
+
+    static bool calibration_logged = false;   
+    if (!calibration_logged) {   
+      tools::logger()->info(   
+        "[task2] yaw_offset={:.3f} rad ({:+.3f} deg)  pitch_offset={:.3f} rad ({:+.3f} deg)  "   
+        "default_v0={:.2f} m/s  hold={:.2f} s",   
+        config.yaw_offset, config.yaw_offset * 180.0 / CV_PI, config.pitch_offset,   
+        config.pitch_offset * 180.0 / CV_PI, config.default_bullet_speed, hold_seconds);   
+      calibration_logged = true;   
+    }   
 
     auto reset = [&] {
       state.target.reset();
@@ -313,26 +314,26 @@ int main(int argc, char * argv[])
     double aim_yaw = 0, aim_pitch = 0, horizon = 0;
     double yaw_tolerance = 0, pitch_tolerance = 0;
     double prediction_model_age = 0, flight_time = 0, selected_face_error = 0;
+    double selected_face_impact = 0.0;  // face_error at impact, drives the fire gate  
     int board_id = -1;
     int trajectory_attempts = 0;
     std::string aim_status = "not_requested", ballistic_status = "not_requested";
     std::vector<std::string> ballistic_candidate_statuses(4, "not_requested");
-    // Measured speed is a ballistic input, without an empirical speed interval. //edit
-    const bool measured_ok =  //edit
-      std::isfinite(feedback.bullet_speed) && feedback.bullet_speed > 0;  //edit
-    // Prefer the measured value; fall back to the configured default so that the first round
-    // can leave the barrel. The switch is data-driven, so no code change is needed later. //edit
-    const double bullet_speed =  //edit
-      measured_ok ? static_cast<double>(feedback.bullet_speed) : config.default_bullet_speed;  //edit
-    const bool speed_valid = std::isfinite(bullet_speed) && bullet_speed > 0;  //edit
-    static int last_speed_source = -1;  //edit
-    const int speed_source = measured_ok ? 1 : 0;  //edit
-    if (speed_source != last_speed_source) {  //edit
-      tools::logger()->warn(  //edit
-        "[task2] bullet speed source -> {} (used={:.3f} m/s, measured={:.3f} m/s)",  //edit
-        measured_ok ? "measured" : "default", bullet_speed, feedback.bullet_speed);  //edit
-      last_speed_source = speed_source;  //edit
-    }  //edit
+    // Measured speed is a ballistic input, without an empirical speed interval.  
+    const bool measured_ok =   
+      std::isfinite(feedback.bullet_speed) && feedback.bullet_speed > 0;   
+     
+    const double bullet_speed =   
+      measured_ok ? static_cast<double>(feedback.bullet_speed) : config.default_bullet_speed;   
+    const bool speed_valid = std::isfinite(bullet_speed) && bullet_speed > 0;   
+    static int last_speed_source = -1;   
+    const int speed_source = measured_ok ? 1 : 0;   
+    if (speed_source != last_speed_source) {   
+      tools::logger()->warn(   
+        "[task2] bullet speed source -> {} (used={:.3f} m/s, measured={:.3f} m/s)",   
+        measured_ok ? "measured" : "default", bullet_speed, feedback.bullet_speed);   
+      last_speed_source = speed_source;   
+    }   
     if (state.target && permitted) {
       // Keep a valid ballistic candidate first; geometric fallback never replaces it.
       auto select_aim = [&](bool ballistic) {
@@ -354,7 +355,7 @@ int main(int argc, char * argv[])
           std::string candidate_status = "not_converged";
           double prediction_time = 0;
           if (ballistic) {
-            fly = state.target->armor_xyza_list()[id].head<3>().norm() / bullet_speed;  //edit
+            fly = state.target->armor_xyza_list()[id].head<3>().norm() / bullet_speed;   
             for (int iteration = 0; iteration < 8; ++iteration) {
               prediction_time = tools::delta_time(now, state.model_time) + config.execution_delay + fly;
               if (prediction_time < 0 || prediction_time > 1.0) {
@@ -370,7 +371,7 @@ int main(int argc, char * argv[])
                 break;
               }
               ++trajectory_attempts;
-              tools::Trajectory trajectory(bullet_speed, distance, board[2], 1);  //edit
+              tools::Trajectory trajectory(bullet_speed, distance, board[2], 1);   
               if (
                 trajectory.unsolvable || !std::isfinite(trajectory.pitch) ||
                 !std::isfinite(trajectory.fly_time) || trajectory.fly_time <= 0) {
@@ -407,28 +408,36 @@ int main(int argc, char * argv[])
           }
           const double yaw = std::atan2(board[1], board[0]);
           const double face_error = std::abs(std::remainder(board[3] - yaw, 2.0 * CV_PI));
+           
+          // face_error_impact is what the fire gate compares against; with no look-ahead it
+          // equals face_error. Kept as its own name so the gate and the selector agree.
+          const double face_error_impact = face_error;
           // The accepted robot command convention is opposite to world elevation.
-          const double desired_pitch = -pitch + config.pitch_offset;  //edit
-          if (face_error > CV_PI / 3 || std::abs(desired_pitch) > pitch_limit) {
-            reject_candidate(id, face_error > CV_PI / 3 ? "board_facing" : "pitch_range");
+          const double desired_pitch = -pitch + config.pitch_offset;   
+          if (face_error_impact > CV_PI / 3 || std::abs(desired_pitch) > pitch_limit) {   
+            reject_candidate(   
+              id, face_error_impact > CV_PI / 3 ? "board_facing" : "pitch_range");   
             continue;
           }
           if (ballistic) ballistic_candidate_statuses[id] = "ballistic";
-          const double cost = face_error + (state.selected_board == id ? -0.1 : 0.0);
+          const double cost =   
+            face_error_impact +   
+            (state.selected_board == id ? -task2_board_hysteresis : 0.0);   
           if (cost >= best) continue;
           best = cost;
           aim_valid = true;
           aim_status = ballistic ? "ballistic" : "geometric";
           ballistic_aim_valid = ballistic;
-          aim_yaw = std::remainder(yaw + config.yaw_offset, 2.0 * CV_PI);  //edit
+          aim_yaw = std::remainder(yaw + config.yaw_offset, 2.0 * CV_PI);   
           aim_pitch = desired_pitch;
           horizon = prediction_time;
           prediction_model_age = tools::delta_time(now, state.model_time);
           flight_time = fly;
           selected_face_error = face_error;
+          selected_face_impact = face_error_impact;   
           board_id = id;
           const double distance = board.head<2>().norm();
-          yaw_tolerance = std::atan2(0.135 * 0.25 * std::cos(face_error), distance);
+          yaw_tolerance = std::atan2(0.135 * 0.25 * std::cos(face_error_impact), distance);   
           pitch_tolerance = std::atan2(0.056 * 0.25, distance);
         }
       };
@@ -472,7 +481,8 @@ int main(int argc, char * argv[])
       state.selected_board = board_id;
     } else {
       state.commanding = false;
-      state.selected_board = -1;
+      // Keep selected_board instead of clearing it: it is only a tie-break bonus, and clearing
+      // it on a single non-firing frame loses the hysteresis and makes the selector flip-flop.  
     }
     const bool feedback_aligned =
       control && pitch_in_range &&
@@ -488,7 +498,11 @@ int main(int argc, char * argv[])
                                      tools::delta_time(command_time, state.last_fire) >= 0.4;//hhh
     const bool cooldown = pulse_low_ready && fire_interval_ready;
     // Rotation stability remains diagnostic; stationary and rotating targets share this decision.
-    const bool fire_ready = control && ballistic_aim_valid && fresh_target && aligned;
+    const bool face_window_ready =   
+      task2_fire_face_limit <= 0.0 ||   
+      (aim_valid && selected_face_impact <= task2_fire_face_limit);   
+    const bool fire_ready =   
+      control && ballistic_aim_valid && fresh_target && aligned && face_window_ready;   
     const bool fire = fire_ready && cooldown;
     std::string fire_block_reasons;
     auto record_block = [&](bool ready, const char * name) {
@@ -507,6 +521,7 @@ int main(int argc, char * argv[])
     record_block(ballistic_aim_valid, "ballistic_aim");
     record_block(feedback_aligned, "feedback_alignment");
     record_block(command_aligned, "command_alignment");
+    record_block(face_window_ready, "face_window");   
     record_block(pulse_low_ready, "pulse_low");
     record_block(fire_interval_ready, "fire_interval");
     if (quitting)
@@ -531,6 +546,8 @@ int main(int argc, char * argv[])
       reason = "pitch_recovery";
     else if (!aligned)
       reason = "alignment";
+    else if (!face_window_ready)   
+      reason = "face_window";   
     else if (!cooldown)
       reason = "cooldown";
     else
@@ -575,13 +592,13 @@ int main(int argc, char * argv[])
        {"omega_std_ready", speed_window_ready},
        {"has_switched_board", state.target ? state.target->jumped : false},
        {"omega_covariance", state.target ? state.target->ekf().P(7, 7) : 0.0},
-       {"bullet_speed_m_s", feedback.bullet_speed},  //edit
-       {"bullet_speed_used_m_s", bullet_speed},  //edit
-       {"bullet_speed_measured_ok", measured_ok ? 1 : 0},  //edit
+       {"bullet_speed_m_s", feedback.bullet_speed},   
+       {"bullet_speed_used_m_s", bullet_speed},   
+       {"bullet_speed_measured_ok", measured_ok ? 1 : 0},   
        {"bullet_speed_valid", speed_valid},
-       {"board_height_offset_m", state.target ? state.target->ekf_x()[10] : 0.0},  //edit
-       {"pitch_offset_rad", config.pitch_offset},  //edit
-       {"yaw_offset_rad", config.yaw_offset},  //edit
+       {"board_height_offset_m", state.target ? state.target->ekf_x()[10] : 0.0},   
+       {"pitch_offset_rad", config.pitch_offset},   
+       {"yaw_offset_rad", config.yaw_offset},   
        {"execution_delay_s", config.execution_delay},
        {"aligned", aligned},
        {"feedback_aligned", feedback_aligned},
@@ -643,22 +660,22 @@ int main(int argc, char * argv[])
     // stable (encoded in st), ballistic_aim_valid (== as=="ballistic"), raw bullet speed,
     // board height offset (always 0 for a 4-board target), and the yaml offsets (logged once
     // at startup). Added: omega_std / P77 / jumped (is omega trustworthy?), bullet and fire
-    // counts (is the 10-round budget being burnt?), and the aim/cmd/fb pitch triple.  //edit
-    // f=frame st=tracking_state w=omega ws=omega_std P77=P(7,7) jmp=board switched  //edit
-    // rs=reason as=aim_status bs=ballistic_status pit=aim/cmd/fb pitch b=bullets f=fires  //edit
-    if (state.frame % 10 == 0) {  //edit
-      tools::logger()->info(  //edit
-        "task2 f={} st={} w={:+.2f} ws={:.2f} P77={:.2f} jmp={} | "  //edit
-        "rs={} as={} bs={} fire={} | v0={:.1f}{} | "  //edit
-        "pit={:.3f}/{:.3f}/{:.3f} | b={}/{}",  //edit
-        state.frame, tracking_state, omega, omega_std,  //edit
-        state.target ? state.target->ekf().P(7, 7) : 0.0,  //edit
-        state.target ? static_cast<int>(state.target->jumped) : 0,  //edit
-        reason, aim_status, ballistic_status, fire ? 1 : 0,  //edit
-        bullet_speed, measured_ok ? "" : "(default)",  //edit
-        aim_pitch, state.command_pitch, feedback.pitch,  //edit
-        feedback.bullet_count, state.fire_count);  //edit
-    }  //edit
+    // counts (is the 10-round budget being burnt?), and the aim/cmd/fb pitch triple.   
+    // f=frame st=tracking_state w=omega ws=omega_std P77=P(7,7) jmp=board switched   
+    // rs=reason as=aim_status bs=ballistic_status pit=aim/cmd/fb pitch b=bullets f=fires   
+    if (state.frame % 10 == 0) {   
+      tools::logger()->info(   
+        "task2 f={} st={} w={:+.2f} ws={:.2f} P77={:.2f} jmp={} | "   
+        "rs={} as={} bs={} fire={} | v0={:.1f}{} | "   
+        "pit={:.3f}/{:.3f}/{:.3f} | b={}/{}",   
+        state.frame, tracking_state, omega, omega_std,   
+        state.target ? state.target->ekf().P(7, 7) : 0.0,   
+        state.target ? static_cast<int>(state.target->jumped) : 0,   
+        reason, aim_status, ballistic_status, fire ? 1 : 0,   
+        bullet_speed, measured_ok ? "" : "(default)",   
+        aim_pitch, state.command_pitch, feedback.pitch,   
+        feedback.bullet_count, state.fire_count);   
+    }   
     state.previous_fire = fire;
     state.output = send_finished;
     ++state.frame;

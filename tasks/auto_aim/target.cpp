@@ -44,9 +44,13 @@ Target::Target(
     {1, 64, 1, 64, 1, 64, 0.4, 100, 0.01, 0.01,
      0.01}};  // Task_2 TODO: 根据实际情况，调整“后三项”预测量协方差矩阵参数
 
-  // Task_3 TODO: 为前哨站建立专有的初始状预测量及其协方差矩阵参数（P0_dig_outpost）
+  // Task_3: x[4] is board 0 height; x[9:10] are board 1/2 offsets from board 0.
+  // The first observed board defines board 0, independently of its physical height.
+  Eigen::VectorXd P0_dig_outpost{
+    {0.04, 0.01, 0.04, 0.01, 0.04, 0.01, 0.4, 25, 0.0004, 0.01, 0.01}};
 
-  Eigen::Matrix<double, 11, 11> P0 = P0_dig_car.asDiagonal();
+  Eigen::Matrix<double, 11, 11> P0 =
+    (is_layered_outpost() ? P0_dig_outpost : P0_dig_car).asDiagonal();
 
   // 防止夹角求和出现异常值
   auto x_add = [](const Eigen::VectorXd & a, const Eigen::VectorXd & b) -> Eigen::VectorXd {
@@ -89,9 +93,9 @@ void Target::predict(double dt)
   double v1, v2;
 
   // Task_2 TODO: 根据实际情况，调整v1与v2
-  v1 = 1;           // 加速度方差
+  v1 = 0.1;           // 加速度方差
   v2 = 16;           // 角加速度方差
-  double v1_z = 1;  // z轴加速度方差
+  double v1_z = 4;  // z轴加速度方差
 
   auto a = dt * dt * dt * dt / 4;
   auto b = dt * dt * dt / 2;
@@ -242,7 +246,17 @@ bool Target::diverged() const
 {
   auto r_ok = ekf_.x[8] > 0.05 && ekf_.x[8] < 0.5;
 
-  //Task_3 TODO: 为前哨站建立专有的发散判定条件
+  // Task_3: l and h are height offsets, not an additional radius.
+  if (is_layered_outpost()) {
+    if (!ekf_.x.allFinite() || !ekf_.P.allFinite() ||
+        ekf_.P.diagonal().minCoeff() < 0.0)
+      return true;
+    const double height_span = std::max({0.0, ekf_.x[9], ekf_.x[10]}) -
+                               std::min({0.0, ekf_.x[9], ekf_.x[10]});
+    const bool heights_ok = std::abs(ekf_.x[9]) <= 0.3 &&
+                            std::abs(ekf_.x[10]) <= 0.3 && height_span <= 0.3;
+    return !r_ok || !heights_ok;
+  }
 
   auto l_ok = ekf_.x[8] + ekf_.x[9] > 0.05 && ekf_.x[8] + ekf_.x[9] < 0.5;
 
@@ -276,11 +290,10 @@ Eigen::Vector3d Target::h_armor_xyz(const Eigen::VectorXd & x, int id) const
   auto armor_y = x[2] - r * std::sin(angle);
   auto armor_z = (use_l_h) ? x[4] + x[10] : x[4];
 
-  // Task_3 TODO: 为前哨站建立专有的高度差计算方法
-  /*
-  double dh = 0.0;  // 高度差
-  auto armor_z = x[4] + dh;  // task_3 tips
-  */
+  // Task_3: all three boards share r; their heights follow the persistent board IDs.
+  if (use_outpost_h) {
+    armor_z += (id == 1) ? x[9] : ((id == 2) ? x[10] : 0.0);
+  }
 
   return {armor_x, armor_y, armor_z};
 }
@@ -302,14 +315,15 @@ Eigen::MatrixXd Target::h_jacobian(const Eigen::VectorXd & x, int id) const
 
   auto dz_dh = use_l_h ? 1.0 : 0.0;
 
-  //  Task_3 tips:
-  // auto dz_dl = 0.0; // Task_3 TODO: 为前哨站建立专有的雅各比阵计算方法
+  // Task_3: differentiate the same board-relative heights used by h_armor_xyz.
+  auto dz_dl = (use_outpost_h && id == 1) ? 1.0 : 0.0;
+  if (use_outpost_h) dz_dh = (id == 2) ? 1.0 : 0.0;
 
   // clang-format off
   Eigen::MatrixXd H_armor_xyza{
     {1, 0, 0, 0, 0, 0, dx_da, 0, dx_dr, dx_dl,     0},
     {0, 0, 1, 0, 0, 0, dy_da, 0, dy_dr, dy_dl,     0},
-    {0, 0, 0, 0, 1, 0,     0, 0,     0,     0, dz_dh},
+    {0, 0, 0, 0, 1, 0,     0, 0,     0, dz_dl, dz_dh},
     {0, 0, 0, 0, 0, 0,     1, 0,     0,     0,     0}
   };
   // clang-format on
