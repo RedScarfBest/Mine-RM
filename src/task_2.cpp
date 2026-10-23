@@ -88,13 +88,13 @@ int main(int argc, char * argv[])
       const auto enemy = tools::read<std::string>(yaml, "enemy_color");
       const double yaw = tools::read<double>(yaml, "yaw_offset") * CV_PI / 180.0;
       const double pitch = tools::read<double>(yaml, "pitch_offset") * CV_PI / 180.0;
-      const double delay = tools::read_or<double>(yaml, "task2_execution_delay_s", 0.0);
+      const double delay = tools::read_or<double>(yaml, "task2_execution_delay_s", 0.045);//hhh
       const double hold = tools::read_or<double>(yaml, "task2_hold_seconds", 0.300);
       const double radius = tools::read_or<double>(yaml, "task2_target_radius_m", 0.2);
       // A measured speed only exists after the first shot (referee 0x020C shoot_data), so a
       // configured fallback is required or the first round can never leave the barrel. //edit
       const double default_v0 =  //edit
-        tools::read_or<double>(yaml, "task2_default_bullet_speed_m_s", 20.0);  //edit
+        tools::read_or<double>(yaml, "task2_default_bullet_speed_m_s", 22.0);  //edit
       if (!std::isfinite(default_v0) || default_v0 <= 0 || default_v0 > 100) {  //edit
         throw std::runtime_error("task2_default_bullet_speed_m_s must be within (0, 100]");  //edit
       }  //edit
@@ -117,8 +117,20 @@ int main(int argc, char * argv[])
     const double hold_seconds = config.hold_seconds;  // Ordinary misses; zero disables coasting.
     constexpr auto camera_timeout = std::chrono::milliseconds(50);
     constexpr double frame_valid_seconds = 0.150;
-    // Match the accepted Task 1 float boundary; this limits the final aim, not yaw turns.
     constexpr double pitch_limit = static_cast<float>(20.0 * CV_PI / 180.0);
+
+    // Print the calibration once. These are per-robot values, and they are easy to run with the
+    // wrong yaml or the wrong unit, so show both rad and deg, and the fallback bullet speed. //edit
+    static bool calibration_logged = false;  //edit
+    if (!calibration_logged) {  //edit
+      tools::logger()->info(  //edit
+        "[task2] yaw_offset={:.3f} rad ({:+.3f} deg)  pitch_offset={:.3f} rad ({:+.3f} deg)  "  //edit
+        "default_v0={:.2f} m/s  hold={:.2f} s",  //edit
+        config.yaw_offset, config.yaw_offset * 180.0 / CV_PI, config.pitch_offset,  //edit
+        config.pitch_offset * 180.0 / CV_PI, config.default_bullet_speed, hold_seconds);  //edit
+      calibration_logged = true;  //edit
+    }  //edit
+
     auto reset = [&] {
       state.target.reset();
       state.speeds.clear();
@@ -396,7 +408,7 @@ int main(int argc, char * argv[])
           const double yaw = std::atan2(board[1], board[0]);
           const double face_error = std::abs(std::remainder(board[3] - yaw, 2.0 * CV_PI));
           // The accepted robot command convention is opposite to world elevation.
-          const double desired_pitch = -pitch + config.pitch_offset;
+          const double desired_pitch = -pitch + config.pitch_offset;  //edit
           if (face_error > CV_PI / 3 || std::abs(desired_pitch) > pitch_limit) {
             reject_candidate(id, face_error > CV_PI / 3 ? "board_facing" : "pitch_range");
             continue;
@@ -408,7 +420,7 @@ int main(int argc, char * argv[])
           aim_valid = true;
           aim_status = ballistic ? "ballistic" : "geometric";
           ballistic_aim_valid = ballistic;
-          aim_yaw = std::remainder(yaw + config.yaw_offset, 2.0 * CV_PI);
+          aim_yaw = std::remainder(yaw + config.yaw_offset, 2.0 * CV_PI);  //edit
           aim_pitch = desired_pitch;
           horizon = prediction_time;
           prediction_model_age = tools::delta_time(now, state.model_time);
@@ -473,7 +485,7 @@ int main(int argc, char * argv[])
     const bool aligned = feedback_aligned && command_aligned;
     const bool pulse_low_ready = !state.previous_fire;
     const bool fire_interval_ready = state.last_fire.time_since_epoch().count() == 0 ||
-                                     tools::delta_time(command_time, state.last_fire) >= 0.2;
+                                     tools::delta_time(command_time, state.last_fire) >= 0.4;//hhh
     const bool cooldown = pulse_low_ready && fire_interval_ready;
     // Rotation stability remains diagnostic; stationary and rotating targets share this decision.
     const bool fire_ready = control && ballistic_aim_valid && fresh_target && aligned;
@@ -567,6 +579,9 @@ int main(int argc, char * argv[])
        {"bullet_speed_used_m_s", bullet_speed},  //edit
        {"bullet_speed_measured_ok", measured_ok ? 1 : 0},  //edit
        {"bullet_speed_valid", speed_valid},
+       {"board_height_offset_m", state.target ? state.target->ekf_x()[10] : 0.0},  //edit
+       {"pitch_offset_rad", config.pitch_offset},  //edit
+       {"yaw_offset_rad", config.yaw_offset},  //edit
        {"execution_delay_s", config.execution_delay},
        {"aligned", aligned},
        {"feedback_aligned", feedback_aligned},
@@ -624,15 +639,26 @@ int main(int argc, char * argv[])
        {"block_reason", reason},
        {"fire_block_reasons", fire_block_reasons},
        {"quitting", quitting}});
-    if (state.frame % 30 == 0) {
-      tools::logger()->info(
-        "task2 frame={} state={} omega_rad_s={:.3f} stable={} control={} fire={} reason={} "
-        "bullet_speed_m_s={:.3f} v0_used_m_s={:.3f} v0_measured={} "  //edit
-        "ballistic_aim_valid={} aim_status={} ballistic_status={}",  //edit
-        state.frame, tracking_state, omega, stable, control, fire, reason, feedback.bullet_speed,
-        bullet_speed, measured_ok,  //edit
-        ballistic_aim_valid, aim_status, ballistic_status);
-    }
+    // Decision inputs that matter for a spinning target. Removed: control (fire implies it),
+    // stable (encoded in st), ballistic_aim_valid (== as=="ballistic"), raw bullet speed,
+    // board height offset (always 0 for a 4-board target), and the yaml offsets (logged once
+    // at startup). Added: omega_std / P77 / jumped (is omega trustworthy?), bullet and fire
+    // counts (is the 10-round budget being burnt?), and the aim/cmd/fb pitch triple.  //edit
+    // f=frame st=tracking_state w=omega ws=omega_std P77=P(7,7) jmp=board switched  //edit
+    // rs=reason as=aim_status bs=ballistic_status pit=aim/cmd/fb pitch b=bullets f=fires  //edit
+    if (state.frame % 10 == 0) {  //edit
+      tools::logger()->info(  //edit
+        "task2 f={} st={} w={:+.2f} ws={:.2f} P77={:.2f} jmp={} | "  //edit
+        "rs={} as={} bs={} fire={} | v0={:.1f}{} | "  //edit
+        "pit={:.3f}/{:.3f}/{:.3f} | b={}/{}",  //edit
+        state.frame, tracking_state, omega, omega_std,  //edit
+        state.target ? state.target->ekf().P(7, 7) : 0.0,  //edit
+        state.target ? static_cast<int>(state.target->jumped) : 0,  //edit
+        reason, aim_status, ballistic_status, fire ? 1 : 0,  //edit
+        bullet_speed, measured_ok ? "" : "(default)",  //edit
+        aim_pitch, state.command_pitch, feedback.pitch,  //edit
+        feedback.bullet_count, state.fire_count);  //edit
+    }  //edit
     state.previous_fire = fire;
     state.output = send_finished;
     ++state.frame;
