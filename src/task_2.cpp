@@ -80,6 +80,7 @@ int main(int argc, char * argv[])
       double execution_delay;
       double hold_seconds;
       double target_radius;
+      double default_bullet_speed;  // used until the referee reports a measured speed //edit
     };
     static Task2State state;
     static const Task2Config config = [&] {
@@ -90,6 +91,13 @@ int main(int argc, char * argv[])
       const double delay = tools::read_or<double>(yaml, "task2_execution_delay_s", 0.0);
       const double hold = tools::read_or<double>(yaml, "task2_hold_seconds", 0.300);
       const double radius = tools::read_or<double>(yaml, "task2_target_radius_m", 0.2);
+      // A measured speed only exists after the first shot (referee 0x020C shoot_data), so a
+      // configured fallback is required or the first round can never leave the barrel. //edit
+      const double default_v0 =  //edit
+        tools::read_or<double>(yaml, "task2_default_bullet_speed_m_s", 20.0);  //edit
+      if (!std::isfinite(default_v0) || default_v0 <= 0 || default_v0 > 100) {  //edit
+        throw std::runtime_error("task2_default_bullet_speed_m_s must be within (0, 100]");  //edit
+      }  //edit
       if (!std::isfinite(radius) || radius <= 0.05 || radius >= 0.5) {
         throw std::runtime_error("task2_target_radius_m must be within (0.05, 0.5) metres");
       }
@@ -103,7 +111,8 @@ int main(int argc, char * argv[])
         throw std::runtime_error("Invalid Task 2 configuration");
       }
       return Task2Config{
-        enemy == "red" ? auto_aim::red : auto_aim::blue, yaw, pitch, delay, hold, radius};
+        enemy == "red" ? auto_aim::red : auto_aim::blue, yaw, pitch, delay, hold, radius,
+        default_v0};  //edit
     }();
     const double hold_seconds = config.hold_seconds;  // Ordinary misses; zero disables coasting.
     constexpr auto camera_timeout = std::chrono::milliseconds(50);
@@ -296,8 +305,22 @@ int main(int argc, char * argv[])
     int trajectory_attempts = 0;
     std::string aim_status = "not_requested", ballistic_status = "not_requested";
     std::vector<std::string> ballistic_candidate_statuses(4, "not_requested");
-    // Measured speed is a ballistic input, without an empirical speed interval.
-    const bool speed_valid = std::isfinite(feedback.bullet_speed) && feedback.bullet_speed > 0;
+    // Measured speed is a ballistic input, without an empirical speed interval. //edit
+    const bool measured_ok =  //edit
+      std::isfinite(feedback.bullet_speed) && feedback.bullet_speed > 0;  //edit
+    // Prefer the measured value; fall back to the configured default so that the first round
+    // can leave the barrel. The switch is data-driven, so no code change is needed later. //edit
+    const double bullet_speed =  //edit
+      measured_ok ? static_cast<double>(feedback.bullet_speed) : config.default_bullet_speed;  //edit
+    const bool speed_valid = std::isfinite(bullet_speed) && bullet_speed > 0;  //edit
+    static int last_speed_source = -1;  //edit
+    const int speed_source = measured_ok ? 1 : 0;  //edit
+    if (speed_source != last_speed_source) {  //edit
+      tools::logger()->warn(  //edit
+        "[task2] bullet speed source -> {} (used={:.3f} m/s, measured={:.3f} m/s)",  //edit
+        measured_ok ? "measured" : "default", bullet_speed, feedback.bullet_speed);  //edit
+      last_speed_source = speed_source;  //edit
+    }  //edit
     if (state.target && permitted) {
       // Keep a valid ballistic candidate first; geometric fallback never replaces it.
       auto select_aim = [&](bool ballistic) {
@@ -319,7 +342,7 @@ int main(int argc, char * argv[])
           std::string candidate_status = "not_converged";
           double prediction_time = 0;
           if (ballistic) {
-            fly = state.target->armor_xyza_list()[id].head<3>().norm() / feedback.bullet_speed;
+            fly = state.target->armor_xyza_list()[id].head<3>().norm() / bullet_speed;  //edit
             for (int iteration = 0; iteration < 8; ++iteration) {
               prediction_time = tools::delta_time(now, state.model_time) + config.execution_delay + fly;
               if (prediction_time < 0 || prediction_time > 1.0) {
@@ -335,7 +358,7 @@ int main(int argc, char * argv[])
                 break;
               }
               ++trajectory_attempts;
-              tools::Trajectory trajectory(feedback.bullet_speed, distance, board[2], 1);
+              tools::Trajectory trajectory(bullet_speed, distance, board[2], 1);  //edit
               if (
                 trajectory.unsolvable || !std::isfinite(trajectory.pitch) ||
                 !std::isfinite(trajectory.fly_time) || trajectory.fly_time <= 0) {
@@ -540,7 +563,9 @@ int main(int argc, char * argv[])
        {"omega_std_ready", speed_window_ready},
        {"has_switched_board", state.target ? state.target->jumped : false},
        {"omega_covariance", state.target ? state.target->ekf().P(7, 7) : 0.0},
-       {"bullet_speed_m_s", std::isfinite(feedback.bullet_speed) ? feedback.bullet_speed : 0.0f},
+       {"bullet_speed_m_s", feedback.bullet_speed},  //edit
+       {"bullet_speed_used_m_s", bullet_speed},  //edit
+       {"bullet_speed_measured_ok", measured_ok ? 1 : 0},  //edit
        {"bullet_speed_valid", speed_valid},
        {"execution_delay_s", config.execution_delay},
        {"aligned", aligned},
@@ -602,10 +627,11 @@ int main(int argc, char * argv[])
     if (state.frame % 30 == 0) {
       tools::logger()->info(
         "task2 frame={} state={} omega_rad_s={:.3f} stable={} control={} fire={} reason={} "
-        "bullet_speed_m_s={:.3f} ballistic_aim_valid={} aim_status={} ballistic_status={}",
-        state.frame, tracking_state, omega, stable, control, fire, reason,
-        std::isfinite(feedback.bullet_speed) ? feedback.bullet_speed : 0.0f, ballistic_aim_valid,
-        aim_status, ballistic_status);
+        "bullet_speed_m_s={:.3f} v0_used_m_s={:.3f} v0_measured={} "  //edit
+        "ballistic_aim_valid={} aim_status={} ballistic_status={}",  //edit
+        state.frame, tracking_state, omega, stable, control, fire, reason, feedback.bullet_speed,
+        bullet_speed, measured_ok,  //edit
+        ballistic_aim_valid, aim_status, ballistic_status);
     }
     state.previous_fire = fire;
     state.output = send_finished;
