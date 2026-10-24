@@ -20,57 +20,11 @@
 #include "tools/trajectory.hpp"  //add
 #include "tools/yaml.hpp"        //add
 
-// ============================================================================
-// Task 3 —— 前哨站建模与击打
-//
-// 和 Task 2（中低速小陀螺）共用同一条流水线：
-//   取帧 → Solver 解算 → 与模型关联 → EKF 预测 → 弹道解算 → 云台门控 → 发火 → 打点
-// 本文件与 src/task_2.cpp 的差异只有三类，全部集中在下面的 task3_* 常量和
-// 「目标识别 / 目标构造」两处：
-//
-//   1) 打谁：前哨站，不是普通车。task3_target_name / task3_armor_num。
-//   2) 几何：前哨站是三块「中部装甲板」，120° 均布在 Ø553 的分布圆上，
-//            三块板高度各不相同（官方图纸 图4-32，板顶高 1116 / 1216 / 1316 mm）；
-//            顶部的顶部装甲板（1446~1578 mm）不建模、不打。
-//            所以 r 三块共用 0.2765 m，z 需要两个额外自由度 —— target.cpp 里
-//            用状态 x[9]/x[10]（dh1/dh2）表示，已经实现并做过数值验证。
-//   3) 节奏：Task 2 是 5 Hz 单发、每挡只许 10 发，每一发都很贵，所以为了准度
-//            加了三道闸；前哨站是 12 Hz、30 s、满分约需 74 发命中（约 21% 命中率），
-//            核心矛盾从「打得准」变成「打得密」。那三道闸提成了 task3_* 常量，
-//            初值保留 Task 2 的取值，实机确认锁敌和 omega 正常后逐条放开。
-//
-// omega 的 5 分看的是 Plotter 上拟合出来的角速度，所以 omega_rad_s 输出 EKF 原始值，
-// 另外用 omega_ready 标注它现在可不可信，不做任何修饰。
-// ============================================================================
-
 const std::string keys =
   "{help h usage ? | | 输出命令行参数说明}"
   "{@config-path   | | yaml配置文件路径 }";
 
 using namespace std::chrono_literals;
-
-// ---------------------------------------------------------------------------
-// 前哨站目标定义
-// ---------------------------------------------------------------------------
-constexpr auto task3_target_name = auto_aim::outpost;  // ArmorName
-constexpr int task3_armor_num = 3;                     // 三块中部装甲板
-constexpr double task3_target_radius = 0.2765;         // m，Ø553 / 2
-// 下面三个不读 yaml：它们是任务口径，不是相机标定。要改就改这里。
-constexpr double task3_execution_delay = 0.0;        // s，model_age 已含采集+推理+解算
-constexpr double task3_hold_seconds = 0.3;           // s，丢目标后允许的滑行时间
-constexpr double task3_default_bullet_speed = 22.0;  // m/s，测速出来之前用的默认值
-
-// ---------------------------------------------------------------------------
-// Task 2 为「每发都值钱」而加的三道闸，这里全部提成常量。
-// 初值刻意保留 Task 2 的取值 —— 第一版只应该体现「打谁变了」，其余行为与
-// 已经跑通 10/10 的 task_2 等价。之后一条一条放开。
-//   board_hysteresis : 3 板 120 度时恒有唯一候选，本项对前哨站实际失效，留作万一。
-//   fire_face_limit  : 只打比较正对的板；0.0 = 关闭（60 度上限仍由 select_aim 兜住）。
-//   fire_interval_s  : 开火最小间隔；考试规格 12 Hz = 1.0 / 12.0 约 0.0833 s。
-// ---------------------------------------------------------------------------
-constexpr double task3_board_hysteresis = 0.1;  // rad
-constexpr double task3_fire_face_limit = 0.26;  // rad 约 15 度；0.0 = 关闭
-constexpr double task3_fire_interval_s = 0.4;   // 2.5 Hz；目标 1.0 / 12.0
 
 int main(int argc, char * argv[])
 {
@@ -99,6 +53,24 @@ int main(int argc, char * argv[])
 
   while (!exiter.exit()) {
     // Your code start
+    // ---------------------------------------------------------------------------
+    // 前哨站目标定义
+    // ---------------------------------------------------------------------------
+    constexpr auto task3_target_name = auto_aim::outpost;  // ArmorName
+    constexpr int task3_armor_num = 3;                     // 三块中部装甲板
+    constexpr double task3_target_radius = 0.2765;         // m，Ø553 / 2
+
+    constexpr double task3_execution_delay = 0.0;        // s，model_age 已含采集+推理+解算
+    constexpr double task3_hold_seconds = 0.3;           // s，丢目标后允许的滑行时间
+    constexpr double task3_default_bullet_speed = 22.0;  // m/s，测速出来之前用的默认值
+
+    //   board_hysteresis : 3 板 120 度时恒有唯一候选，本项对前哨站实际失效，留作万一。
+    //   fire_face_limit  : 只打比较正对的板；0.0 = 关闭（60 度上限仍由 select_aim 兜住）。
+    //   fire_interval_s  : 开火最小间隔；考试规格 12 Hz = 1.0 / 12.0 约 0.0833 s。
+    constexpr double task3_board_hysteresis = 0.1;  // rad
+    constexpr double task3_fire_face_limit = 0.785;  // rad , 0.0 = 60 度
+    constexpr double task3_fire_interval_s = 0.075;   // 
+
     struct Task3State
     {
       int frame = 0;
@@ -134,7 +106,7 @@ int main(int argc, char * argv[])
       const auto enemy = tools::read<std::string>(yaml, "enemy_color");
       const double yaw = tools::read<double>(yaml, "yaw_offset") * CV_PI / 180.0;
       const double pitch = tools::read<double>(yaml, "pitch_offset") * CV_PI / 180.0;
-      // 前哨站专属参数不放进 yaml：那是任务口径，不是相机标定，统一写在文件顶部常量里。
+      
       if (
         (enemy != "red" && enemy != "blue") || !std::isfinite(yaw) || !std::isfinite(pitch) ||
         std::abs(yaw) > CV_PI || std::abs(pitch) > CV_PI) {
@@ -254,8 +226,7 @@ int main(int argc, char * argv[])
               score = std::numeric_limits<double>::infinity();
               for (const auto & board : state.target->armor_xyza_list()) {
                 const double distance = (board.head<3>() - armor.xyz_in_world).norm();
-                // 前哨站画面里可能同时出现「中部装甲板」和「顶部装甲板」（同类名），
-                // 所以关联要同时卡平面距离和高度，否则会跳板把 EKF 拉崩。
+                
                 const double dz = std::abs(board[2] - armor.xyz_in_world[2]);
                 const double angle =
                   std::abs(std::remainder(board[3] - armor.ypr_in_world[0], 2.0 * CV_PI));
@@ -271,8 +242,7 @@ int main(int argc, char * argv[])
               best_score = score;
             }
           }
-          // 前哨站候选探针：离线拿不到前哨站画面，前哨站到底检不检得出来
-          // 只能实机量。锁住之后把这条日志降级或删掉。
+
           if (!state.target && !armors.empty() && state.frame % 30 == 0) {
             std::string seen;
             for (const auto & armor : armors) {
@@ -717,13 +687,7 @@ int main(int argc, char * argv[])
        {"block_reason", reason},
        {"fire_block_reasons", fire_block_reasons},
        {"quitting", quitting}});
-    // Decision inputs that matter for a spinning target. Removed: control (fire implies it),
-    // stable (encoded in st), ballistic_aim_valid (== as=="ballistic"), raw bullet speed,
-    // board height offset (always 0 for a 4-board target), and the yaml offsets (logged once
-    // at startup). Added: omega_std / P77 / jumped (is omega trustworthy?), bullet and fire
-    // counts (is the 10-round budget being burnt?), and the aim/cmd/fb pitch triple.   
-    // f=frame st=tracking_state w=omega ws=omega_std P77=P(7,7) jmp=board switched   
-    // rs=reason as=aim_status bs=ballistic_status pit=aim/cmd/fb pitch b=bullets f=fires   
+  
     if (state.frame % 10 == 0) {   
       tools::logger()->info(
         "task3 f={} st={} w={:+.2f} ws={:+.2f} P77={:.2f} jmp={} dz=({:+.3f},{:+.3f}) | "

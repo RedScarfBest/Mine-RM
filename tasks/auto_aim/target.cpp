@@ -94,7 +94,7 @@ void Target::predict(double dt)
 
   // Task_2 TODO: 根据实际情况，调整v1与v2
   v1 = 0.1;           // 加速度方差
-  v2 = 16;           // 角加速度方差
+  v2 = 4;           // 角加速度方差
   double v1_z = 4;  // z轴加速度方差
 
   auto a = dt * dt * dt * dt / 4;
@@ -282,13 +282,13 @@ bool Target::is_layered_outpost() const { return name == ArmorName::outpost && a
 Eigen::Vector3d Target::h_armor_xyz(const Eigen::VectorXd & x, int id) const
 {
   auto angle = tools::limit_rad(x[6] + id * 2 * CV_PI / armor_num_);
-  auto use_l_h = (armor_num_ == 4) && (id == 1 || id == 3);
-  auto use_outpost_h = is_layered_outpost();
+  auto use_l_h = (armor_num_ == 4) && (id == 1 || id == 3);//4
+  auto use_outpost_h = is_layered_outpost();//3
 
   auto r = (use_l_h) ? x[8] + x[9] : x[8];
   auto armor_x = x[0] - r * std::cos(angle);
   auto armor_y = x[2] - r * std::sin(angle);
-  auto armor_z = (use_l_h) ? x[4] + x[10] : x[4];
+  auto armor_z = (use_l_h) ? x[4] + x[10] : x[4]; //
 
   // Task_3: all three boards share r; their heights follow the persistent board IDs.
   if (use_outpost_h) {
