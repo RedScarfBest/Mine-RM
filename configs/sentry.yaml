@@ -1,5 +1,5 @@
-# enemy_color: "red"
-enemy_color: "blue"
+enemy_color: "red"
+# enemy_color: "blue"
 rotation_angle: 180
 
 #####-----神经网络参数-----#####
@@ -17,8 +17,8 @@ roi:
 
 threshold: 100
 
-yaw_offset: 2 # degree -2.5
-pitch_offset: 6.5 # degree 2
+yaw_offset: 0.5 # degree -2.5
+pitch_offset: -1.5 # degree 2
 
 camera_name: "hikrobot"
 exposure_ms: 5.0

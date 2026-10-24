@@ -68,8 +68,8 @@ int main(int argc, char * argv[])
     //   fire_face_limit  : 只打比较正对的板；0.0 = 关闭（60 度上限仍由 select_aim 兜住）。
     //   fire_interval_s  : 开火最小间隔；考试规格 12 Hz = 1.0 / 12.0 约 0.0833 s。
     constexpr double task3_board_hysteresis = 0.1;  // rad
-    constexpr double task3_fire_face_limit = 0.785;  // rad , 0.0 = 60 度
-    constexpr double task3_fire_interval_s = 0.075;   // 
+    constexpr double task3_fire_face_limit = 0.80;  // rad , 0.0 = 60 度
+    constexpr double task3_fire_interval_s = 0.0833;   // 
 
     struct Task3State
     {
