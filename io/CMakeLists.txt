@@ -8,7 +8,6 @@ add_subdirectory(serial)
 add_library(io STATIC 
     hikrobot/hikrobot.cpp    
     camera.cpp
-    dev_video_camera.cpp
     gimbal/gimbal.cpp
 )
 
